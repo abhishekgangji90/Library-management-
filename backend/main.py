@@ -1,8 +1,10 @@
 import os
-from fastapi import FastAPI, HTTPException, Body
+from fastapi import FastAPI, HTTPException, Body, Header
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from pymongo import MongoClient
+# pyrefly: ignore [missing-import]
+import certifi
 from typing import List, Optional
 from datetime import datetime, date
 import uuid
@@ -25,7 +27,7 @@ app.add_middleware(
 MONGODB_URL = os.getenv("MONGODB_URL", "mongodb://localhost:27017/")
 DATABASE_NAME = os.getenv("DATABASE_NAME", "library_management_system")
 
-client = MongoClient(MONGODB_URL)
+client = MongoClient(MONGODB_URL, tlsCAFile=certifi.where())
 db = client[DATABASE_NAME]
 books_collection = db["books"]
 members_collection = db["members"]
@@ -184,22 +186,24 @@ def read_root():
 
 # --- Dashboard Statistics ---
 @app.get("/api/dashboard")
-def get_dashboard_stats():
-    total_books = sum(b.get("quantity", 0) for b in books_collection.find())
-    available_books = sum(b.get("available_copies", 0) for b in books_collection.find())
+def get_dashboard_stats(x_user_email: Optional[str] = Header(None)):
+    user_filter = {"owner_email": x_user_email} if x_user_email else {}
+    
+    total_books = sum(b.get("quantity", 0) for b in books_collection.find(user_filter))
+    available_books = sum(b.get("available_copies", 0) for b in books_collection.find(user_filter))
     issued_books = total_books - available_books
-    total_members = members_collection.count_documents({})
+    total_members = members_collection.count_documents(user_filter)
     
     # Overdue calculation
     today = datetime.now().date()
     overdue_transactions = 0
-    active_transactions = transactions_collection.find({"status": "active"})
+    active_transactions = transactions_collection.find({**user_filter, "status": "active"})
     for t in active_transactions:
         due_date = datetime.strptime(t["due_date"], "%Y-%m-%d").date()
         if today > due_date:
             overdue_transactions += 1
             
-    recent_activities = list(transactions_collection.find({}, {"_id": 0}).sort("issue_date", -1).limit(5))
+    recent_activities = list(transactions_collection.find(user_filter, {"_id": 0}).sort("issue_date", -1).limit(5))
 
     return {
         "total_books": total_books,
@@ -212,32 +216,37 @@ def get_dashboard_stats():
 
 # --- Book Endpoints ---
 @app.get("/api/books")
-def get_books():
-    books = list(books_collection.find({}, {"_id": 0}))
+def get_books(x_user_email: Optional[str] = Header(None)):
+    user_filter = {"owner_email": x_user_email} if x_user_email else {}
+    books = list(books_collection.find(user_filter, {"_id": 0}))
     return books
 
 @app.post("/api/books")
-def add_book(book: BookCreate):
+def add_book(book: BookCreate, x_user_email: Optional[str] = Header(None)):
+    if not x_user_email:
+        raise HTTPException(status_code=401, detail="User email required for this action")
+        
     if book.quantity < 0:
         raise HTTPException(status_code=400, detail="Quantity cannot be negative")
     
-    existing_book = books_collection.find_one({"isbn": book.isbn})
+    existing_book = books_collection.find_one({"isbn": book.isbn, "owner_email": x_user_email})
     if existing_book:
-        raise HTTPException(status_code=400, detail="Book with this ISBN already exists")
+        raise HTTPException(status_code=400, detail="Book with this ISBN already exists in your library")
     
     book_id = str(uuid.uuid4())
     new_book = book.dict()
     new_book["book_id"] = book_id
     new_book["available_copies"] = book.quantity
+    new_book["owner_email"] = x_user_email
     
     books_collection.insert_one(new_book)
     return {"message": "Book added successfully", "book_id": book_id}
 
 @app.put("/api/books/{book_id}")
-def update_book(book_id: str, book: BookCreate):
-    existing_book = books_collection.find_one({"book_id": book_id})
+def update_book(book_id: str, book: BookCreate, x_user_email: Optional[str] = Header(None)):
+    existing_book = books_collection.find_one({"book_id": book_id, "owner_email": x_user_email})
     if not existing_book:
-        raise HTTPException(status_code=404, detail="Book not found")
+        raise HTTPException(status_code=404, detail="Book not found in your library")
         
     if book.quantity < 0:
         raise HTTPException(status_code=400, detail="Quantity cannot be negative")
@@ -250,87 +259,97 @@ def update_book(book_id: str, book: BookCreate):
     update_data = book.dict()
     update_data["available_copies"] = new_available
     
-    books_collection.update_one({"book_id": book_id}, {"$set": update_data})
+    books_collection.update_one({"book_id": book_id, "owner_email": x_user_email}, {"$set": update_data})
     return {"message": "Book updated successfully"}
 
 @app.delete("/api/books/{book_id}")
-def delete_book(book_id: str):
-    active_txn = transactions_collection.find_one({"book_id": book_id, "status": "active"})
+def delete_book(book_id: str, x_user_email: Optional[str] = Header(None)):
+    active_txn = transactions_collection.find_one({"book_id": book_id, "owner_email": x_user_email, "status": "active"})
     if active_txn:
         raise HTTPException(status_code=400, detail="Cannot delete book. It is currently issued.")
         
-    result = books_collection.delete_one({"book_id": book_id})
+    result = books_collection.delete_one({"book_id": book_id, "owner_email": x_user_email})
     if result.deleted_count == 0:
-        raise HTTPException(status_code=404, detail="Book not found")
+        raise HTTPException(status_code=404, detail="Book not found in your library")
     return {"message": "Book deleted successfully"}
 
 # --- Member Endpoints ---
 @app.get("/api/members")
-def get_members():
-    members = list(members_collection.find({}, {"_id": 0}))
+def get_members(x_user_email: Optional[str] = Header(None)):
+    user_filter = {"owner_email": x_user_email} if x_user_email else {}
+    members = list(members_collection.find(user_filter, {"_id": 0}))
     return members
 
 @app.post("/api/members")
-def add_member(member: MemberCreate):
-    existing_member = members_collection.find_one({"email": member.email})
+def add_member(member: MemberCreate, x_user_email: Optional[str] = Header(None)):
+    if not x_user_email:
+        raise HTTPException(status_code=401, detail="User email required for this action")
+        
+    existing_member = members_collection.find_one({"email": member.email, "owner_email": x_user_email})
     if existing_member:
-        raise HTTPException(status_code=400, detail="Member with this email already exists")
+        raise HTTPException(status_code=400, detail="Member with this email already exists in your library")
         
     member_id = str(uuid.uuid4())
     new_member = member.dict()
     new_member["member_id"] = member_id
     new_member["registration_date"] = datetime.now().strftime("%Y-%m-%d")
+    new_member["owner_email"] = x_user_email
     
     members_collection.insert_one(new_member)
     return {"message": "Member added successfully", "member_id": member_id}
 
 @app.put("/api/members/{member_id}")
-def update_member(member_id: str, member: MemberCreate):
-    existing_member = members_collection.find_one({"member_id": member_id})
+def update_member(member_id: str, member: MemberCreate, x_user_email: Optional[str] = Header(None)):
+    existing_member = members_collection.find_one({"member_id": member_id, "owner_email": x_user_email})
     if not existing_member:
-        raise HTTPException(status_code=404, detail="Member not found")
+        raise HTTPException(status_code=404, detail="Member not found in your library")
         
-    members_collection.update_one({"member_id": member_id}, {"$set": member.dict()})
+    members_collection.update_one({"member_id": member_id, "owner_email": x_user_email}, {"$set": member.dict()})
     return {"message": "Member updated successfully"}
 
 @app.delete("/api/members/{member_id}")
-def delete_member(member_id: str):
-    active_txn = transactions_collection.find_one({"member_id": member_id, "status": "active"})
+def delete_member(member_id: str, x_user_email: Optional[str] = Header(None)):
+    active_txn = transactions_collection.find_one({"member_id": member_id, "owner_email": x_user_email, "status": "active"})
     if active_txn:
         raise HTTPException(status_code=400, detail="Cannot delete member with active book issues.")
         
-    result = members_collection.delete_one({"member_id": member_id})
+    result = members_collection.delete_one({"member_id": member_id, "owner_email": x_user_email})
     if result.deleted_count == 0:
-        raise HTTPException(status_code=404, detail="Member not found")
+        raise HTTPException(status_code=404, detail="Member not found in your library")
     return {"message": "Member deleted successfully"}
 
 # --- Transaction Endpoints ---
 @app.get("/api/transactions")
-def get_transactions():
-    txns = list(transactions_collection.find({}, {"_id": 0}))
+def get_transactions(x_user_email: Optional[str] = Header(None)):
+    user_filter = {"owner_email": x_user_email} if x_user_email else {}
+    txns = list(transactions_collection.find(user_filter, {"_id": 0}))
     # Enrich with member and book details for frontend
     for t in txns:
-        book = books_collection.find_one({"book_id": t["book_id"]})
-        member = members_collection.find_one({"member_id": t["member_id"]})
+        book = books_collection.find_one({"book_id": t["book_id"], "owner_email": x_user_email})
+        member = members_collection.find_one({"member_id": t["member_id"], "owner_email": x_user_email})
         t["book_title"] = book["title"] if book else "Unknown Book"
         t["member_name"] = member["name"] if member else "Unknown Member"
     return txns
 
 @app.post("/api/issue")
-def issue_book(req: IssueRequest):
-    book = books_collection.find_one({"book_id": req.book_id})
+def issue_book(req: IssueRequest, x_user_email: Optional[str] = Header(None)):
+    if not x_user_email:
+        raise HTTPException(status_code=401, detail="User email required for this action")
+        
+    book = books_collection.find_one({"book_id": req.book_id, "owner_email": x_user_email})
     if not book:
-        raise HTTPException(status_code=404, detail="Book not found")
+        raise HTTPException(status_code=404, detail="Book not found in your library")
     if book["available_copies"] <= 0:
         raise HTTPException(status_code=400, detail="No copies available for this book")
         
-    member = members_collection.find_one({"member_id": req.member_id})
+    member = members_collection.find_one({"member_id": req.member_id, "owner_email": x_user_email})
     if not member:
-        raise HTTPException(status_code=404, detail="Member not found")
+        raise HTTPException(status_code=404, detail="Member not found in your library")
         
     existing_txn = transactions_collection.find_one({
         "member_id": req.member_id, 
         "book_id": req.book_id, 
+        "owner_email": x_user_email,
         "status": "active"
     })
     if existing_txn:
@@ -344,34 +363,35 @@ def issue_book(req: IssueRequest):
         "issue_date": datetime.now().strftime("%Y-%m-%d"),
         "due_date": req.due_date,
         "return_date": None,
-        "status": "active"
+        "status": "active",
+        "owner_email": x_user_email
     }
     
     transactions_collection.insert_one(transaction)
     books_collection.update_one(
-        {"book_id": req.book_id},
+        {"book_id": req.book_id, "owner_email": x_user_email},
         {"$inc": {"available_copies": -1}}
     )
     
     return {"message": "Book issued successfully", "transaction_id": txn_id}
 
 @app.post("/api/return")
-def return_book(req: ReturnRequest):
-    txn = transactions_collection.find_one({"transaction_id": req.transaction_id})
+def return_book(req: ReturnRequest, x_user_email: Optional[str] = Header(None)):
+    txn = transactions_collection.find_one({"transaction_id": req.transaction_id, "owner_email": x_user_email})
     if not txn:
-        raise HTTPException(status_code=404, detail="Transaction not found")
+        raise HTTPException(status_code=404, detail="Transaction not found in your library")
     if txn["status"] == "returned":
         raise HTTPException(status_code=400, detail="Book already returned")
         
     return_date = datetime.now().strftime("%Y-%m-%d")
     
     transactions_collection.update_one(
-        {"transaction_id": req.transaction_id},
+        {"transaction_id": req.transaction_id, "owner_email": x_user_email},
         {"$set": {"status": "returned", "return_date": return_date}}
     )
     
     books_collection.update_one(
-        {"book_id": txn["book_id"]},
+        {"book_id": txn["book_id"], "owner_email": x_user_email},
         {"$inc": {"available_copies": 1}}
     )
     

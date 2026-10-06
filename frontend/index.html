@@ -934,9 +934,15 @@
         // API Calls & Data Rendering
         async function fetchAPI(endpoint, options = {}) {
             try {
+                const user = JSON.parse(localStorage.getItem('user'));
+                const headers = { 'Content-Type': 'application/json' };
+                if (user && user.email) {
+                    headers['X-User-Email'] = user.email;
+                }
+                
                 const response = await fetch(`${API_URL}${endpoint}`, {
-                    headers: { 'Content-Type': 'application/json' },
-                    ...options
+                    ...options,
+                    headers: { ...headers, ...(options.headers || {}) }
                 });
                 const data = await response.json();
                 if (!response.ok) throw new Error(data.detail || 'An error occurred');
